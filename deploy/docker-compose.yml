@@ -1,0 +1,102 @@
+# 开发与演示编排：在 deploy 目录执行 docker compose up -d --build，访问 http://localhost
+# 加载演示数据、只提供 HTTP，不用于生产（生产使用 ./clinic.sh，见 docs/deploy.md）
+#
+# 资源限制按校医院单机部署估算（应用 2 核 4G），压测时同样使用这套配置，保证数字可复现。
+
+name: campus-clinic-his
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-root}
+      DB_APP_PASSWORD: ${DB_APP_PASSWORD:-clinic_app_dev}
+      DB_MIGRATOR_PASSWORD: ${DB_MIGRATOR_PASSWORD:-clinic_migrator_dev}
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+08:00
+      - --innodb-buffer-pool-size=1G
+    volumes:
+      - mysql-data:/var/lib/mysql
+      # 首次初始化时创建业务库、审计库和两个最小权限账号；初始化期间临时服务不监听 TCP，
+      # 所以健康检查走 127.0.0.1，初始化完成前不会被判为健康
+      - ./mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${DB_ROOT_PASSWORD:-root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 2g
+
+  redis:
+    image: redis:8.8-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512m
+
+  backend:
+    build:
+      context: ../backend
+      args:
+        MAVEN_MIRROR: ${MAVEN_MIRROR:-}
+    environment:
+      SPRING_PROFILES_ACTIVE: ${PROFILE:-dev}
+      DB_HOST: mysql
+      DB_APP_PASSWORD: ${DB_APP_PASSWORD:-clinic_app_dev}
+      DB_MIGRATOR_PASSWORD: ${DB_MIGRATOR_PASSWORD:-clinic_migrator_dev}
+      REDIS_HOST: redis
+      # 机构名称（演示名称，可在 .env 中覆盖）
+      CLINIC_ORG_NAME: ${CLINIC_ORG_NAME:-实践大学校医院}
+      JWT_SECRET: ${JWT_SECRET:-change-me-change-me-change-me-change-me-0123}
+    # 不映射端口：只由 Nginx 在容器网络内访问
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4g
+
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/nginx/Dockerfile
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-}
+    environment:
+      # 开发与演示编排只提供 HTTP；生产编排固定为 required（见 docker-compose.prod.yml）
+      CLINIC_TLS: "off"
+    ports:
+      - "${WEB_PORT:-80}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  mysql-data:
+  redis-data:

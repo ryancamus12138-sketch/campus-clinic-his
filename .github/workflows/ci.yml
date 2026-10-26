@@ -1,0 +1,156 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "dev/**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend (Maven + Testcontainers)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+      - name: Build and test
+        # 显式指定 bash 才会启用 pipefail；否则 tee 会吞掉 Maven 的失败退出码
+        shell: bash
+        run: mvn -B -ntp verify 2>&1 | tee build.log
+      - name: Test summary
+        if: always()
+        run: |
+          grep -E "Tests run: [0-9]+, Failures.*-- in" build.log | sed -E 's/.*Tests run/Tests run/' > tests.txt || true
+          # 量化指标测试打印的 [M*] / [concurrency] 结果行
+          grep -E "^\[(M[0-9]+|concurrency)\]" build.log >> tests.txt || true
+          # M11：按业务模块汇总 JaCoCo 行覆盖率
+          python3 - >> tests.txt <<'PY' || true
+          import csv, collections, glob
+          lines = collections.defaultdict(lambda: [0, 0])
+          for f in glob.glob('clinic-server/target/site/jacoco-aggregate/jacoco.csv'):
+              for r in csv.DictReader(open(f)):
+                  parts = r['PACKAGE'].split('.')
+                  module = parts[4] if len(parts) > 4 else parts[-1]
+                  lines[module][0] += int(r['LINE_COVERED'])
+                  lines[module][1] += int(r['LINE_MISSED'])
+          total = [sum(v[0] for v in lines.values()), sum(v[1] for v in lines.values())]
+          fmt = lambda c, m: f"{100 * c / max(1, c + m):.1f}% ({c}/{c + m})"
+          print('[M11] line coverage total ' + fmt(*total))
+          for k in sorted(lines):
+              print(f'[M11]   {k}: ' + fmt(*lines[k]))
+          PY
+          {
+            echo "### Backend tests"
+            echo '```'
+            cat tests.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # 注释长度有上限：指标与覆盖率单独一条，测试用例统计另一条
+          python3 - <<'PY'
+          text = open('tests.txt').read().splitlines()
+          metrics = [l for l in text if l.startswith('[')]
+          tests = [l for l in text if not l.startswith('[')]
+          enc = lambda ls: '\n'.join(ls)[:8000].replace('%', '%25').replace('\n', '%0A')
+          print('::notice title=Backend metrics::' + enc(metrics))
+          print('::notice title=Backend tests::' + enc(tests))
+          PY
+      - name: Coverage gate (M11)
+        run: |
+          # 核心业务模块行覆盖率不低于 80%
+          python3 - <<'PY'
+          import csv, collections, sys
+          lines = collections.defaultdict(lambda: [0, 0])
+          for r in csv.DictReader(open('clinic-server/target/site/jacoco-aggregate/jacoco.csv')):
+              parts = r['PACKAGE'].split('.')
+              lines[parts[4]][0] += int(r['LINE_COVERED'])
+              lines[parts[4]][1] += int(r['LINE_MISSED'])
+          failed = []
+          for module in ('schedule', 'charge', 'pharmacy', 'finance', 'clinic', 'common', 'patient', 'audit'):
+              c, m = lines[module]
+              ratio = c / max(1, c + m)
+              print(f'{module}: {ratio:.1%}')
+              if ratio < 0.80:
+                  failed.append(module)
+          if failed:
+              print(f'::error title=Coverage below 80%::{failed}')
+              sys.exit(1)
+          PY
+
+      - name: Report failure details
+        if: failure()
+        run: |
+          # 把失败的测试及其断言信息写成 annotation，便于在提交页面直接看到原因
+          python3 - <<'EOF'
+          # 每个失败的测试单独一条（annotation 单条有长度上限），去掉框架栈帧，同一测试只报一次
+          import re
+          lines = open('build.log', errors='replace').read().splitlines()
+          seen, notes = set(), []
+          for i, line in enumerate(lines):
+              m = re.search(r'\[ERROR\] (\S+) -- Time elapsed.*<<< (FAILURE|ERROR)!', line)
+              if m and m.group(1) not in seen:
+                  seen.add(m.group(1))
+                  body = [l for l in lines[i + 1:i + 40]
+                          if not re.match(r'\s+at (org\.|java\.|jdk\.|tools\.|com\.|sun\.)', l)]
+                  cut = next((k for k, l in enumerate(body) if l.startswith('[') or l.startswith('20')), len(body))
+                  notes.append((m.group(1), '\n'.join(body[:cut])[:3500]))
+              elif 'COMPILATION ERROR' in line:
+                  notes.append(('compile', '\n'.join(lines[i:i + 30])[:3500]))
+          if not notes:
+              notes.append(('build', '\n'.join(lines[-60:])[-3500:]))
+          for title, text in notes[:10]:
+              short = title.rsplit('.', 2)[-2:] if '.' in title else [title]
+              print('::error title=' + '.'.join(short) + '::'
+                    + text.replace('%', '%25').replace('\r', '').replace('\n', '%0A'))
+          EOF
+
+  admin-web:
+    name: Admin web (lint + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: admin-web
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: admin-web/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npx prettier --check src/
+      - run: npm run lint
+      - run: npm run build
+
+  nginx:
+    name: Nginx (HTTP, HTTPS, missing certificate, ACME bootstrap)
+    runs-on: ubuntu-latest
+    needs: [admin-web]
+    steps:
+      - uses: actions/checkout@v5
+      # 构建与生产相同的 web 镜像，以桩后端分别验证四种启动方式，见脚本开头的说明
+      - name: Verify the Nginx image
+        run: deploy/nginx/test-nginx.sh
+
+  docker:
+    name: Docker images
+    runs-on: ubuntu-latest
+    needs: [backend, admin-web]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build images
+        run: docker compose -f deploy/docker-compose.yml build 2>&1 | tee docker.log
+      - name: Report failure details
+        if: failure()
+        run: |
+          msg=$(tail -n 60 docker.log | python3 -c "import sys;print(sys.stdin.read()[:12000].replace('%','%25').replace('\r','').replace('\n','%0A'))")
+          echo "::error title=Docker build failed::${msg}"

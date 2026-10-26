@@ -1,0 +1,126 @@
+name: Perf
+
+# 压测较慢，不随每次提交运行：手动触发，或推送到 perf/ 开头的分支
+on:
+  workflow_dispatch:
+  push:
+    branches: ["perf/**"]
+
+jobs:
+  daily-charge:
+    # M7 日常收费 10 倍峰值、M8 150 万条流水的月报（编号含义见 docs/design.md“验证”）
+    name: Performance (charging peak, monthly report)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      COMPOSE: docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.perf.yml
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Start MySQL, Redis and backend (backend limited to 2 CPU / 4 GB)
+        run: $COMPOSE up -d --build mysql redis backend
+
+      - name: Wait for backend
+        run: |
+          for i in $(seq 1 120); do
+            curl -fs http://localhost:8080/actuator/health && exit 0
+            sleep 3
+          done
+          $COMPOSE logs backend | tail -n 100
+          exit 1
+
+      - name: Seed 3000 patients
+        run: $COMPOSE exec -T mysql mysql -uroot -proot clinic < perf/seed/perf-patients.sql
+
+      - name: "k6: M7 daily charging (10/s for 10 min + 50/s burst for 1 min)"
+        run: |
+          mkdir -p perf/results && chmod 777 perf/results
+          docker run --rm --network host -v "$PWD/perf:/perf" grafana/k6:1.0.0 \
+            run -e BASE_URL=http://localhost:8080 /perf/k6/charge.js 2>&1 | tee perf/results/k6-charge.log
+
+      - name: Check M7 side effects (ledger, invoices)
+        if: always()
+        run: |
+          sleep 15
+          $COMPOSE exec -T mysql mysql -uroot -proot clinic -t -e "
+            SELECT COUNT(*) AS paid_orders, SUM(paid_amount) AS paid FROM charge_order WHERE status = 2;
+            SELECT COUNT(DISTINCT biz_no) AS ledger_pays, SUM(amount) AS ledger_sum FROM fund_ledger WHERE biz_type = 1;
+            SELECT status, COUNT(*) FROM outbox_message GROUP BY status;
+            SELECT invoice_type, status, COUNT(*) FROM e_invoice GROUP BY invoice_type, status;" \
+            | tee perf/results/m7-db.txt
+
+      - name: "M8: seed 1.5M ledger rows"
+        if: always()
+        run: |
+          start=$(date +%s)
+          $COMPOSE exec -T mysql mysql -uroot -proot clinic < perf/seed/ledger-1.5m.sql
+          echo "seed_seconds=$(( $(date +%s) - start ))" | tee perf/results/m8.txt
+          $COMPOSE exec -T mysql mysql -uroot -proot clinic -N -e \
+            "SELECT CONCAT('ledger_rows_aug=', COUNT(*)) FROM fund_ledger WHERE ledger_date BETWEEN '2026-08-01' AND '2026-08-30'" \
+            | tee -a perf/results/m8.txt
+
+      - name: "M8: monthly report, scanning the ledger vs pre-aggregated"
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json, statistics, time, urllib.request
+          base = 'http://localhost:8080'
+          def call(method, path, token=None, body=None):
+              req = urllib.request.Request(base + path, method=method, data=json.dumps(body).encode() if body else None,
+                                           headers={'Content-Type': 'application/json',
+                                                    **({'Authorization': 'Bearer ' + token} if token else {})})
+              t = time.perf_counter()
+              with urllib.request.urlopen(req, timeout=120) as r:
+                  data = json.loads(r.read())
+              return data, (time.perf_counter() - t) * 1000
+          token = call('POST', '/api/auth/login', body={'username': 'admin', 'password': 'Admin@2026'})[0]['data']['accessToken']
+          rebuild = 0
+          for day in range(1, 31):
+              rebuild += call('POST', f'/api/finance/reports/rebuild?date=2026-08-{day:02d}', token)[1]
+          q = '/api/finance/reports/summary?from=2026-08-01&to=2026-08-30'
+          results = {}
+          for source in ('ledger', 'agg'):
+              call('GET', f'{q}&source={source}', token)  # 预热
+              times = [call('GET', f'{q}&source={source}', token)[1] for _ in range(10)]
+              data = call('GET', f'{q}&source={source}', token)[0]['data']
+              results[source] = (statistics.median(times), max(times), data['total'])
+          lines = [f'rebuild_30_days_ms={rebuild:.0f}']
+          for source, (med, mx, total) in results.items():
+              lines.append(f'{source}: median={med:.1f}ms max={mx:.1f}ms total={total}')
+          lines.append('same_result=' + str(results['ledger'][2] == results['agg'][2]))
+          text = '\n'.join(lines)
+          print(text)
+          open('perf/results/m8.txt', 'a').write(text + '\n')
+          PY
+
+      - name: Report
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import json, os, re
+          lines = []
+          path = 'perf/results/charge-summary.json'
+          if os.path.exists(path):
+              m = json.load(open(path))['metrics']
+              v = lambda k: m.get(k, {}).get('values', {})
+              lines.append(f"[M7] settled={int(v('charge_settled').get('count', 0))} failed={int(v('charge_failed').get('count', 0))}"
+                           f" http_failed_rate={v('http_req_failed').get('rate', 0):.5f} reqs={int(v('http_reqs').get('count', 0))}")
+              for key in ('http_req_duration', 'http_req_duration{scenario:steady}', 'http_req_duration{scenario:burst}'):
+                  lines.append(f'[M7] {key}: ' + ', '.join(f'{k}={x:.1f}' for k, x in v(key).items()))
+          log = 'perf/results/k6-charge.log'
+          if os.path.exists(log):
+              lines += ['[M7] ' + l.strip() for l in open(log, errors='replace') if 'thresholds on metrics' in l]
+          for f in ('perf/results/m7-db.txt', 'perf/results/m8.txt'):
+              if os.path.exists(f):
+                  lines.append(open(f).read())
+          text = '\n'.join(lines) or 'no results'
+          print(text)
+          print('::notice title=M7 M8::' + text.replace('%', '%25').replace('\n', '%0A'))
+          EOF
+
+      - name: Backend errors
+        if: always()
+        run: |
+          $COMPOSE logs --no-color backend 2>&1 | grep -E " ERROR " | sed -E 's/^[^|]*\| //' | sort | uniq -c | sort -rn | head -n 20 || true

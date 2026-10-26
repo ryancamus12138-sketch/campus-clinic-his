@@ -1,0 +1,274 @@
+name: Security
+
+# 安全扫描较慢，手动触发或推送到 security/ 开头的分支
+on:
+  workflow_dispatch:
+  push:
+    branches: ["security/**"]
+
+jobs:
+  scan:
+    # M10：编号含义见 docs/design.md“验证”
+    name: Security scan (OWASP ZAP, Trivy)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      COMPOSE: docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.perf.yml
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Start the full stack (Nginx + admin web + backend)
+        run: $COMPOSE up -d --build
+
+      - name: Wait for stack
+        run: |
+          for i in $(seq 1 150); do
+            curl -fs http://localhost:8080/actuator/health >/dev/null && curl -fs http://localhost/ >/dev/null && exit 0
+            sleep 3
+          done
+          $COMPOSE ps; $COMPOSE logs --tail 80
+          exit 1
+
+      - name: Security headers
+        run: curl -sI http://localhost/ | tee security-headers.txt
+
+      - name: "ZAP baseline: admin web via Nginx"
+        run: |
+          mkdir -p zap && chmod 777 zap
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t http://localhost/ -J baseline.json -I 2>&1 | tail -n 40
+
+      - name: "ZAP API active scan with an admin token"
+        run: |
+          token=$(curl -s -X POST http://localhost:8080/api/auth/login -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"Admin@2026"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"]["accessToken"])')
+          # 打包扫描脚本支持用环境变量给每个请求加认证头
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk:rw" -e ZAP_AUTH_HEADER_VALUE="Bearer $token" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-api-scan.py -t http://localhost:8080/v3/api-docs -f openapi -J api.json -I -T 30 \
+            2>&1 | tail -n 40
+
+      - name: "Trivy: backend and nginx images (HIGH/CRITICAL)"
+        run: |
+          for svc in backend web; do
+            image=$($COMPOSE images $svc --format json | python3 -c 'import json,sys;d=json.load(sys.stdin);d=d[0] if isinstance(d,list) else d;print(d["Repository"]+":"+d["Tag"])')
+            echo "$svc image=$image"
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/zap:/out" aquasec/trivy:latest \
+              image --severity HIGH,CRITICAL --format json --output /out/trivy-$svc.json --quiet "$image" || true
+          done
+
+      - name: Report
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import collections, json, os
+          lines = []
+          risk = {'0': 'Info', '1': 'Low', '2': 'Medium', '3': 'High'}
+          for name in ('baseline', 'api'):
+              path = f'zap/{name}.json'
+              if not os.path.exists(path):
+                  lines.append(f'[ZAP {name}] no report')
+                  continue
+              alerts = [a for site in json.load(open(path)).get('site', []) for a in site.get('alerts', [])]
+              counts = collections.Counter(risk[a['riskcode']] for a in alerts)
+              lines.append(f'[ZAP {name}] alerts by risk: ' + ', '.join(f'{k}={counts.get(k, 0)}' for k in ('High', 'Medium', 'Low', 'Info')))
+              for a in sorted(alerts, key=lambda a: -int(a['riskcode'])):
+                  if a['riskcode'] in ('3', '2', '1'):
+                      lines.append(f"  [{risk[a['riskcode']]}] {a['name']} (instances={len(a.get('instances', []))})")
+          for svc in ('backend', 'web'):
+              path = f'zap/trivy-{svc}.json'
+              if not os.path.exists(path):
+                  lines.append(f'[Trivy {svc}] no report')
+                  continue
+              results = json.load(open(path)).get('Results', [])
+              vulns = [dict(v, Target=r.get('Target', '')) for r in results for v in (r.get('Vulnerabilities') or [])]
+              sev = collections.Counter(v['Severity'] for v in vulns)
+              lines.append(f"[Trivy {svc}] HIGH={sev.get('HIGH', 0)} CRITICAL={sev.get('CRITICAL', 0)}")
+              pkgs = collections.Counter(f"{v['PkgName']} {v.get('InstalledVersion', '')} -> {v.get('FixedVersion') or 'no fix'} [{v['Target'][-60:]}]" for v in vulns)
+              for p, c in pkgs.most_common(25):
+                  lines.append(f'    {c:3d} {p}')
+          if os.path.exists('security-headers.txt'):
+              lines.append('[headers] ' + ' | '.join(l.strip() for l in open('security-headers.txt') if ':' in l))
+          text = '\n'.join(lines)
+          print(text)
+          print('::notice title=Security scan::' + text[:60000].replace('%', '%25').replace('\n', '%0A'))
+          EOF
+
+  production:
+    # M18：与 clinic.sh 相同的两份编排；密钥文件、HTTPS、机构名称、部署包中没有测试替身、首次登录、TLS 扫描
+    name: Production stack (HTTPS, secrets, first login, TLS)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      COMPOSE: docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.prod.yml
+      CLINIC_ORG_NAME: 配置覆盖测试校医院
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Generate secrets and a self-signed certificate
+        run: |
+          ./deploy/gen-secrets.sh
+          ls -l deploy/secrets
+          # 没有证书时运维脚本拒绝启动，不会以 HTTP 对外服务
+          if ./deploy/clinic.sh up; then echo "::error::缺少证书时 clinic.sh up 没有拒绝"; exit 1; fi
+          mkdir -p deploy/certs
+          openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj "/CN=localhost" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+            -keyout deploy/certs/privkey.pem -out deploy/certs/fullchain.pem 2>/dev/null
+
+      - name: Start the production stack
+        run: $COMPOSE up -d --build
+
+      - name: Wait for HTTPS
+        run: |
+          for i in $(seq 1 150); do
+            curl -kfs https://localhost/api/auth/options >/dev/null && exit 0
+            sleep 3
+          done
+          $COMPOSE ps; $COMPOSE logs --tail 120
+          exit 1
+
+      - name: Deployment checks
+        run: |
+          fail() { echo "::error title=Deployment check::$1"; exit 1; }
+          # 只开放 80/443；数据库、Redis、后端没有映射到宿主机
+          for s in mysql:3306 redis:6379 backend:8080; do
+            out=$($COMPOSE port "${s%%:*}" "${s##*:}" 2>&1 || true)
+            echo "port $s -> $out"
+            echo "$out" | grep -qE '^[0-9.:\[\]]+:[0-9]+$' && fail "$s 被映射到了宿主机: $out"
+          done
+          # HTTP 跳转 HTTPS，HTTPS 带 HSTS
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost/)
+          [ "$code" = 301 ] || fail "HTTP 没有跳转到 HTTPS（$code）"
+          curl -ksI https://localhost/ | tee https-headers.txt
+          grep -qi '^strict-transport-security: max-age=63072000' https-headers.txt || fail "HTTPS 缺少 HSTS"
+          # 健康检查：后端与 Nginx 容器都为 healthy；管理端点中只有 health 经 Nginx 对内网开放
+          for svc in backend web; do
+            for i in $(seq 1 20); do
+              st=$(docker inspect -f '{{.State.Health.Status}}' "$($COMPOSE ps -q $svc)")
+              [ "$st" = healthy ] && break
+              sleep 3
+            done
+            echo "health $svc -> $st"
+            [ "$st" = healthy ] || fail "$svc 健康检查不是 healthy（$st）"
+          done
+          code=$(curl -ks -o /dev/null -w '%{http_code}' https://localhost/actuator/prometheus)
+          [ "$code" = 404 ] || fail "指标端点经 Nginx 对外可见（$code）"
+          # 生产环境不执行开发环境初始化（演示号源）
+          if $COMPOSE logs backend 2>&1 | grep -q '开发环境初始化'; then fail "生产环境执行了开发环境初始化"; fi
+          active=$($COMPOSE logs --no-color backend 2>&1 | grep -i 'profile.* active' | head -n 3 || true)
+          echo "profile -> $active"
+          echo "$active" | grep -q 'prod' || fail "后端没有以 prod Profile 运行: ${active:-日志中没有 Profile 信息}"
+          # 前端路由刷新
+          curl -kfs https://localhost/charge/settle | grep -q 'id="app"' || fail "前端路由刷新没有返回管理端页面"
+          # 生产环境不暴露接口文档、不带演示账号
+          curl -ks https://localhost/v3/api-docs | grep -q '"openapi"' && fail "接口文档对外暴露"
+          demo=$(curl -ks -X POST https://localhost/api/auth/login -H 'Content-Type: application/json' \
+            -d '{"username":"cashier01","password":"Clinic@2026"}')
+          echo "demo login -> $demo"
+          echo "$demo" | grep -q '"code":10001' || fail "演示账号在生产环境可以登录: $demo"
+          # 机构名称来自配置；部署包里没有任何模拟平台（镜像中没有 Mock 类）
+          opts=$(curl -ks https://localhost/api/auth/options)
+          echo "options -> $opts"
+          echo "$opts" | grep -q '"orgName":"配置覆盖测试校医院"' || fail "机构名称没有按配置显示: $opts"
+          docker cp "$($COMPOSE ps -q backend)":/app/app.jar app.jar
+          unzip -l app.jar > jar.txt
+          grep -q 'BOOT-INF/classes/io/github/ryancamus/clinic/charge/service/CounterCheckoutService.class' jar.txt || fail "没有读到部署包内容"
+          if grep -E 'BOOT-INF/classes/.*(/mock/|/Mock[A-Za-z]*[.]class)' jar.txt; then fail "部署包中含模拟实现"; fi
+          # MySQL 只接受加密连接，后端能正常工作说明它的连接走的是 TLS
+          tls=$($COMPOSE exec -T mysql sh -c 'mysql -uroot -p"$(cat /run/secrets/db_root_password)" -N -e "SELECT @@require_secure_transport"' 2>/dev/null | tr -d '\r')
+          [ "$tls" = 1 ] || fail "MySQL 未强制 TLS（$tls）"
+          # 应用账号没有 DDL 权限，也改不了审计库
+          $COMPOSE exec -T mysql sh -c 'mysql -uroot -p"$(cat /run/secrets/db_root_password)" -N -e "SHOW GRANTS FOR clinic_app@\"%\""' 2>/dev/null | tee grants.txt
+          grep -q 'ALL PRIVILEGES' grants.txt && fail "应用账号权限过大"
+          grep -q 'GRANT SELECT, INSERT ON `clinic_audit`' grants.txt || fail "审计库权限不对: $(cat grants.txt)"
+          echo "[M18] deployment checks passed"
+
+      - name: First admin login (forced password change)
+        run: |
+          python3 - <<'PY'
+          import json, ssl, urllib.request
+          ctx = ssl._create_unverified_context()
+          def post(path, body, token=None):
+              req = urllib.request.Request('https://localhost' + path, data=json.dumps(body).encode(),
+                                           headers={'Content-Type': 'application/json',
+                                                    **({'Authorization': 'Bearer ' + token} if token else {})})
+              try:
+                  return json.load(urllib.request.urlopen(req, context=ctx))
+              except urllib.error.HTTPError as e:
+                  return json.load(e)
+          initial = open('deploy/secrets/admin_initial_password').read().strip()
+          r = post('/api/auth/login', {'username': 'admin', 'password': initial})['data']
+          assert r['step'] == 'PASSWORD_CHANGE' and r.get('challenge'), r
+          r = post('/api/auth/password/expired', {'challenge': r['challenge'], 'newPassword': 'Prod#Secure2026x'})['data']
+          assert r.get('accessToken'), r
+          me = json.load(urllib.request.urlopen(urllib.request.Request('https://localhost/api/auth/me',
+                         headers={'Authorization': 'Bearer ' + r['accessToken']}), context=ctx))['data']
+          assert me['username'] == 'admin'
+          r = post('/api/auth/login', {'username': 'admin', 'password': 'Prod#Secure2026x'})['data']
+          assert r.get('accessToken') and not r.get('step'), r
+          print('[M18] first admin login: PASSWORD_CHANGE -> tokens; next login with the new password gets tokens directly')
+          PY
+
+      - name: "testssl.sh: TLS configuration"
+        run: |
+          mkdir -p tls && chmod 777 tls
+          # CI 用自签名证书：把它作为受信任的 CA 交给 testssl，评级反映的就是 TLS 配置本身
+          cp deploy/certs/fullchain.pem tls/ci-ca.pem
+          docker run --rm --network host -v "$PWD/tls:/data" drwetter/testssl.sh:3.2 \
+            --quiet --color 0 --add-ca /data/ci-ca.pem --jsonfile /data/testssl.json --severity LOW \
+            https://localhost:443 2>&1 | tail -n 60 || true
+
+      - name: "ZAP baseline over HTTPS"
+        run: |
+          mkdir -p zap && chmod 777 zap
+          docker run --rm --network host -v "$PWD/zap:/zap/wrk:rw" ghcr.io/zaproxy/zaproxy:stable \
+            zap-baseline.py -t https://localhost/ -J baseline-https.json -I 2>&1 | tail -n 30
+
+      - name: Report
+        if: always()
+        run: |
+          python3 - <<'EOF2'
+          import collections, json, os
+          lines = []
+          if os.path.exists('tls/testssl.json'):
+              findings = json.load(open('tls/testssl.json'))
+              # CI 用的是自签名证书，证书信任链相关的条目不计入（生产使用正式证书）
+              findings = [f for f in findings if not str(f.get('id', '')).startswith('cert_')
+                          and f.get('id') not in ('chain_of_trust', 'cert_chain_of_trust')]
+              sev = collections.Counter(f.get('severity') for f in findings)
+              lines.append('[M18] testssl severities: ' + ', '.join(f'{k}={sev.get(k, 0)}' for k in ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW')))
+              for f in findings:
+                  if f.get('id') in ('SSLv2', 'SSLv3', 'TLS1', 'TLS1_1', 'TLS1_2', 'TLS1_3', 'HSTS', 'cert_trust', 'overall_grade') \
+                          or f.get('severity') in ('CRITICAL', 'HIGH', 'MEDIUM', 'LOW'):
+                      lines.append(f"  {f.get('id')}: {f.get('severity')} {f.get('finding')}"[:200])
+          else:
+              lines.append('[M18] testssl: no report')
+          if os.path.exists('zap/baseline-https.json'):
+              risk = {'0': 'Info', '1': 'Low', '2': 'Medium', '3': 'High'}
+              alerts = [a for s in json.load(open('zap/baseline-https.json')).get('site', []) for a in s.get('alerts', [])]
+              c = collections.Counter(risk[a['riskcode']] for a in alerts)
+              lines.append('[M18] ZAP baseline (https): ' + ', '.join(f'{k}={c.get(k, 0)}' for k in ('High', 'Medium', 'Low')))
+              for a in alerts:
+                  if a['riskcode'] in ('3', '2', '1'):
+                      lines.append(f"  [{risk[a['riskcode']]}] {a['name']}")
+          text = '\n'.join(lines)
+          print(text)
+          print('::notice title=Production stack::' + text[:8000].replace('%', '%25').replace('\n', '%0A'))
+          EOF2
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          $COMPOSE ps -a
+          $COMPOSE logs --tail 150
+          # 失败原因写成注释，便于在运行页面直接查看
+          for svc in backend web; do
+            msg=$($COMPOSE logs --no-color --tail 60 $svc 2>&1 | grep -vE '^\s*at |^\s*\.\.\. [0-9]+ more' | tail -n 40 \
+              | python3 -c "import sys;print(sys.stdin.read()[-6000:].replace('%','%25').replace('\r','').replace('\n','%0A'))")
+            echo "::error title=$svc logs::$msg"
+          done

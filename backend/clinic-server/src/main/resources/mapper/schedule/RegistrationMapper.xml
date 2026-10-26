@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.ryancamus.clinic.schedule.mapper.RegistrationMapper">
+
+    <insert id="insertBatch">
+        INSERT INTO registration
+            (id, reg_no, patient_id, slot_id, status, charge_order_id, expire_time,
+             create_time, update_time, create_by, update_by, version)
+        VALUES
+        <foreach collection="list" item="r" separator=",">
+            (#{r.id}, #{r.regNo}, #{r.patientId}, #{r.slotId}, #{r.status}, #{r.chargeOrderId}, #{r.expireTime},
+             #{r.createTime}, #{r.updateTime}, #{r.createBy}, #{r.updateBy}, 0)
+        </foreach>
+    </insert>
+
+</mapper>

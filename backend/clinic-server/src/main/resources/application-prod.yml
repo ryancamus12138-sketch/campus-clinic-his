@@ -1,0 +1,24 @@
+# 生产环境
+# 密钥来自 Docker secrets：/run/secrets/ 下的文件名即配置项名（见 deploy/docker-compose.prod.yml），
+# 优先级高于本文件和 application.yml；也可以用环境变量注入。
+spring:
+  config:
+    import: optional:configtree:/run/secrets/
+
+# 不暴露接口文档
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false
+
+clinic:
+  security:
+    jwt:
+      secret: ${JWT_SECRET:}
+
+logging:
+  structured:
+    # JSON 日志（ECS 格式）：集中日志按字段检索，链路 ID（traceId）、级别、类名都是独立字段
+    format:
+      console: ecs

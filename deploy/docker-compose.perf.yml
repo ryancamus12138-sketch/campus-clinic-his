@@ -1,0 +1,10 @@
+# 只用于 CI 中的压测与安全扫描（Perf、Security 工作流）：把后端和数据库端口暴露到宿主机，便于 k6 直连和核对数据。
+# 不得用于生产，也不要与 docker-compose.prod.yml 一起使用。
+#   docker compose -f docker-compose.yml -f docker-compose.perf.yml up -d --build mysql redis backend
+services:
+  backend:
+    ports:
+      - "8080:8080"
+  mysql:
+    ports:
+      - "3306:3306"

@@ -1,0 +1,33 @@
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+*.iml
+.vscode/*
+!.vscode/extensions.json
+
+# Java / Maven
+target/
+*.class
+*.log
+hs_err_pid*
+
+# Node
+node_modules/
+dist/
+*.local
+.eslintcache
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# 生产密钥与证书只在服务器上，绝不提交
+deploy/secrets/
+deploy/certs/
+tools/screenshots/node_modules/
+tools/screenshots/package*.json
+shots/
+deploy/acme/
+deploy/config/

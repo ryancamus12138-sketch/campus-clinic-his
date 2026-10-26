@@ -1,0 +1,17 @@
+spring:
+  flyway:
+    locations: classpath:db/migration,classpath:db/seed-dev
+
+clinic:
+  # 测试中不自动调度，由测试直接调用任务方法，结果可控
+  jobs:
+    enabled: false
+  security:
+    jwt:
+      secret: test-only-secret-test-only-secret-0123456789
+  # 测试专用密钥，只用于 Testcontainers 中的临时数据库
+  crypto:
+    active-key-id: 1
+    index-key: 9u09CLlmJTGcG3UxwatmU+PmWxf4fhb2IuaiM8ElB4U=
+    keys:
+      1: rvnNEAWEpwFTQgjsNgDJIA==

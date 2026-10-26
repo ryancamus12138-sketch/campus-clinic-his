@@ -1,0 +1,2 @@
+# 迁移脚本的 SHA-256 登记在 migration-lock.txt，统一使用 LF 换行，避免在不同系统上检出后校验不一致
+backend/clinic-server/src/main/resources/db/**/*.sql text eol=lf

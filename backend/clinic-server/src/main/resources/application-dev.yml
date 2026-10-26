@@ -1,0 +1,16 @@
+# 开发环境：额外加载演示数据（演示账号、科室号源等），生产环境不加载
+spring:
+  datasource:
+    password: ${DB_APP_PASSWORD:clinic_app_dev}
+  flyway:
+    locations: classpath:db/migration,classpath:db/seed-dev
+    password: ${DB_MIGRATOR_PASSWORD:clinic_migrator_dev}
+
+clinic:
+  security:
+    cors-allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173,http://localhost:5174}
+  # 开发环境专用密钥，已公开，仅用于演示数据；生产环境不加载本文件，若误用这些值启动会失败（ProductionSecretsGuard）
+  crypto:
+    index-key: ysOy5m6YK7osPsMnoV+mk3f4dIE0pUT3b2DaKl7vx30=
+    keys:
+      1: S6O6m/q76co+EogOhjJclw==

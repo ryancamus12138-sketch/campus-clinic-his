@@ -1,0 +1,47 @@
+/* :root:root 提高优先级，避免按需加载的 Element Plus 基础样式覆盖主题色 */
+:root:root {
+  --el-color-primary: #0f766e;
+  --el-color-primary-light-3: #57a39d;
+  --el-color-primary-light-5: #87bbb6;
+  --el-color-primary-light-7: #b7d6d3;
+  --el-color-primary-light-8: #cfe4e2;
+  --el-color-primary-light-9: #e7f1f0;
+  --el-color-primary-dark-2: #0c5e58;
+  --app-sidebar-width: 220px;
+  --app-header-height: 56px;
+  --app-bg: #f4f6f8;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei',
+    sans-serif;
+  color: #1f2937;
+  background: var(--app-bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+.page-card {
+  background: #fff;
+  border-radius: 8px;
+  padding: 20px;
+}
+
+.page-toolbar {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}

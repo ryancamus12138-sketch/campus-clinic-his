@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="io.github.ryancamus.clinic.schedule.mapper.ScheduleSlotMapper">
+
+    <insert id="insertIgnoreBatch">
+        INSERT IGNORE INTO schedule_slot
+            (id, campus_id, dept_id, doctor_id, slot_type, slot_date, start_time, end_time,
+             total, remaining, price_item_code, status, open_time,
+             create_time, update_time, create_by, update_by, version)
+        VALUES
+        <foreach collection="slots" item="s" separator=",">
+            (#{s.id}, #{s.campusId}, #{s.deptId}, #{s.doctorId}, #{s.slotType}, #{s.slotDate}, #{s.startTime},
+             #{s.endTime}, #{s.total}, #{s.remaining}, #{s.priceItemCode}, #{s.status}, #{s.openTime},
+             #{s.createTime}, #{s.updateTime}, #{s.createBy}, #{s.updateBy}, 0)
+        </foreach>
+    </insert>
+
+</mapper>

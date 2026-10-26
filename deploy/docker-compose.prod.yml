@@ -1,0 +1,116 @@
+# 生产部署：在基础编排之上叠加，通过 ./clinic.sh 使用（见 docs/deploy.md）
+#   ./gen-secrets.sh                 # 首次部署生成密钥
+#   放置证书 certs/fullchain.pem、certs/privkey.pem
+#   ./clinic.sh up
+#
+# 与开发编排的区别：
+#   - 所有密码和密钥来自 secrets/ 下的文件（Docker secrets），不出现在环境变量、镜像和仓库里；
+#   - 只对外开放 80/443，数据库、Redis、后端都不映射端口；
+#   - Nginx 只提供 HTTPS，证书缺失时拒绝启动（CLINIC_TLS=required），不会退回明文 HTTP；
+#   - MySQL 强制 TLS 连接，Redis 设置密码；
+#   - 不加载演示数据（演示账号、演示收费项目和患者）；
+#   - 容器异常退出自动重启，日志按大小滚动。
+
+x-restart: &restart
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "10"
+
+services:
+  mysql:
+    <<: *restart
+    environment:
+      MYSQL_ROOT_PASSWORD: ""
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+      DB_APP_PASSWORD: ""
+      DB_APP_PASSWORD_FILE: /run/secrets/db_app_password
+      DB_MIGRATOR_PASSWORD: ""
+      DB_MIGRATOR_PASSWORD_FILE: /run/secrets/db_migrator_password
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+08:00
+      - --innodb-buffer-pool-size=1G
+      # 应用到数据库的连接必须加密（MySQL 8.4 启动时自动生成服务端证书）
+      - --require-secure-transport=ON
+      # 二进制日志保留 7 天：配合全量备份可以恢复到任意时间点（见 docs/deploy.md 的“备份”）
+      - --binlog-expire-logs-seconds=604800
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$(cat /run/secrets/db_root_password)\" --silent"]
+    secrets: [db_root_password, db_app_password, db_migrator_password]
+
+  redis:
+    <<: *restart
+    # 经官方入口脚本启动，才会降权为 redis 用户运行
+    command: ["sh", "-c", "exec docker-entrypoint.sh redis-server --appendonly yes --requirepass \"$$(cat /run/secrets/redis_password)\""]
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$(cat /run/secrets/redis_password)\" redis-cli ping | grep -q PONG"]
+    secrets: [redis_password]
+
+  backend:
+    <<: *restart
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      DB_HOST: mysql
+      DB_SSL_MODE: REQUIRED
+      DB_APP_PASSWORD: ""
+      DB_MIGRATOR_PASSWORD: ""
+      REDIS_HOST: redis
+      JWT_SECRET: ""
+      CLINIC_ORG_NAME: ${CLINIC_ORG_NAME:-实践大学校医院}
+      # 当前加密数据所用的数据密钥编号（secrets/crypto_key_1 对应 1）
+      CRYPTO_ACTIVE_KEY_ID: ${CRYPTO_ACTIVE_KEY_ID:-1}
+    # 本校配置（如报销比例 clinic.charge.fee-policies）：Spring Boot 自动读取工作目录下 config/application.yml
+    volumes:
+      - ./config:/app/config:ro
+    # 文件名即配置项名称，由 application-prod.yml 中的 configtree 导入
+    secrets:
+      - source: db_app_password
+        target: spring.datasource.password
+      - source: db_migrator_password
+        target: spring.flyway.password
+      - source: redis_password
+        target: spring.data.redis.password
+      - source: jwt_secret
+        target: clinic.security.jwt.secret
+      - source: crypto_key_1
+        target: clinic.crypto.keys.1
+      - source: crypto_index_key
+        target: clinic.crypto.index-key
+      - source: admin_initial_password
+        target: clinic.bootstrap.admin-password
+
+  web:
+    <<: *restart
+    environment:
+      # 固定为 required：证书缺失时 Nginx 拒绝启动。首次签发证书用 ./clinic.sh cert-bootstrap
+      CLINIC_TLS: required
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./certs:/etc/nginx/certs:ro
+      # ACME http-01 验证文件目录：宿主机上的证书工具（如 certbot --webroot）写入，Nginx 只读
+      - ./acme:/var/www/acme:ro
+
+secrets:
+  db_root_password:
+    file: ./secrets/db_root_password
+  db_app_password:
+    file: ./secrets/db_app_password
+  db_migrator_password:
+    file: ./secrets/db_migrator_password
+  redis_password:
+    file: ./secrets/redis_password
+  jwt_secret:
+    file: ./secrets/jwt_secret
+  crypto_key_1:
+    file: ./secrets/crypto_key_1
+  crypto_index_key:
+    file: ./secrets/crypto_index_key
+  admin_initial_password:
+    file: ./secrets/admin_initial_password
+
